@@ -1,21 +1,23 @@
 {
-  "name": "pi-skill-conflict-filter",
-  "version": "0.1.1",
-  "description": "A pi extension that hides duplicate skill collision diagnostics from the startup TUI.",
+  "name": "pi-quiet-diagnostics",
+  "version": "0.2.0",
+  "description": "A pi extension that silences advisory startup diagnostics (skill collisions, extension package/command warnings) while keeping real errors visible.",
   "type": "module",
   "license": "MIT",
   "keywords": [
     "pi-package",
     "pi-extension",
     "skills",
+    "extensions",
+    "diagnostics",
     "tui"
   ],
   "scripts": {
-    "test": "node --test skill-conflict-filter.test.mjs"
+    "test": "node --test quiet-diagnostics.test.mjs"
   },
   "pi": {
     "extensions": [
-      "./extensions/skill-conflict-filter.ts"
+      "./extensions/quiet-diagnostics.ts"
     ]
   },
   "peerDependencies": {
