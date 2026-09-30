@@ -13,6 +13,17 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
  * extensions, sessions, and model context are untouched: real problems stay
  * visible (`Failed to load extension`, invalid Skill/Prompt/Theme metadata),
  * while advisory noise is dropped.
+ *
+ * Lifecycle (v0.3.0): the patch is installed **once, at module load**, and is
+ * never removed for the life of the process.
+ *
+ * Earlier versions installed from the `session_start` handler and released the
+ * patch on `session_shutdown`. That left a window — a session switch (`/resume`,
+ * `--continue`, `--resume` from a picker) tears the old session down and builds a
+ * new one — where a warning could be rendered by a briefly unpatched prototype.
+ * A display-only filter has no reason to be transient, so it now stays installed
+ * for the process lifetime. Real problems still surface: a failing or missing
+ * patch reports through `/quiet-diagnostics` and a one-time startup notification.
  */
 
 type DiagnosticRecord = {
@@ -94,11 +105,18 @@ export function dropExtensionWarnings<T extends ExtensionsResult>(result: T): T 
   return { ...result, warnings: [] };
 }
 
-/** `main.js` renders every extension warning as `Extension package "<path>": <warning>`. */
-const SILENCED_STARTUP_WARNING = /^Extension package\b/;
+/**
+ * `main.js` renders every extension warning as
+ * `Extension package "<path>": <warning>`. Match on a couple of stable anchors
+ * (the `Extension package` prefix and pi's own "must be declared in
+ * peerDependencies" text) so a wording tweak upstream doesn't let the noise
+ * back in. A leading `Warning: ` is stripped defensively.
+ */
+const SILENCED_STARTUP_WARNING = /^Extension package\b|Host-provided extension packages must be declared in peerDependencies/;
 
 export function isSilencedStartupWarning(message: string): boolean {
-  return SILENCED_STARTUP_WARNING.test(message);
+  if (typeof message !== "string") return false;
+  return SILENCED_STARTUP_WARNING.test(message.replace(/^Warning:\s*/, ""));
 }
 
 type TemporaryOverride = {
@@ -193,36 +211,55 @@ export function createPatchedShowLoadedResources(
 /** Swallow replayed extension warnings; every other chat warning is untouched. */
 export function createPatchedShowWarning(original: ShowWarning): ShowWarning {
   return function patchedShowWarning(this: unknown, message: string) {
-    if (typeof message === "string" && isSilencedStartupWarning(message)) return undefined;
+    if (isSilencedStartupWarning(message)) return undefined;
     return original.call(this, message);
   };
 }
 
+// ---------------------------------------------------------------------------
+// Install-once state
+//
+// Shared across module instances (pi re-evaluates the module on `/reload`)
+// via a process-global symbol, so a reload never double-wraps the prototype and
+// never leaves it unpatched. The patch is intentionally never released.
+// ---------------------------------------------------------------------------
+
 const STATE_KEY = Symbol.for("pi-quiet-diagnostics.state");
+const PATCH_MARKER = Symbol.for("pi-quiet-diagnostics.patched");
+
+type PatchStatus = "not-installed" | "installed" | "failed";
 
 type PatchState = {
-  refCount: number;
-  cleanup?: (() => void) | undefined;
-  installPromise?: Promise<() => void> | undefined;
-  release?: (() => Promise<void>) | undefined;
+  status: PatchStatus;
+  installPromise?: Promise<PatchStatus> | undefined;
+  error?: string;
+  /** Ordered log of session_start reasons seen, for `/quiet-diagnostics`. */
+  sessionStarts: string[];
 };
-
-function getState(): PatchState {
-  const values = globalThis as typeof globalThis & {
-    [STATE_KEY]?: PatchState;
-  };
-  values[STATE_KEY] ??= { refCount: 0 };
-  return values[STATE_KEY];
-}
 
 type InteractiveModePrototype = {
   showLoadedResources: ShowLoadedResources;
   showWarning: ShowWarning;
 };
 
-async function importInteractiveMode(): Promise<{
-  prototype: InteractiveModePrototype;
-}> {
+function getState(): PatchState {
+  const values = globalThis as typeof globalThis & {
+    [STATE_KEY]?: PatchState;
+  };
+  values[STATE_KEY] ??= { status: "not-installed", sessionStarts: [] };
+  return values[STATE_KEY];
+}
+
+function isMarkedPatched(fn: unknown): boolean {
+  return typeof fn === "function" && Boolean((fn as Record<symbol, unknown>)[PATCH_MARKER]);
+}
+
+function markPatched<T extends AnyFunction>(fn: T): T {
+  Object.defineProperty(fn, PATCH_MARKER, { value: true, configurable: true });
+  return fn;
+}
+
+async function importInteractiveMode(): Promise<InteractiveModePrototype> {
   // Import through pi's extension loader (jiti alias / virtualModules) so the
   // class resolves to the running instance under both dist and bundled builds.
   const module = (await import("@earendil-works/pi-coding-agent")) as {
@@ -231,7 +268,7 @@ async function importInteractiveMode(): Promise<{
   if (!module.InteractiveMode?.prototype) {
     throw new Error("InteractiveMode missing");
   }
-  return module.InteractiveMode;
+  return module.InteractiveMode.prototype;
 }
 
 const PATCHES = [
@@ -239,65 +276,61 @@ const PATCHES = [
   { name: "showWarning", create: createPatchedShowWarning },
 ] as const;
 
-async function installPatch(): Promise<() => void> {
-  const { prototype } = await importInteractiveMode();
+/**
+ * Resolve every original first: a newer pi that renamed one of these methods
+ * must fail open (nothing patched) instead of half-silencing startup.
+ */
+async function installPatch(): Promise<PatchStatus> {
+  const prototype = await importInteractiveMode();
 
-  // Resolve every original first: a newer pi that renamed one of these methods
-  // must fail open (nothing patched) instead of half-silencing startup.
+  const patchedHolder = prototype as unknown as Record<string, unknown>;
+
+  // Already patched (a `/reload` re-evaluated this module, or two instances
+  // raced): do nothing so we never double-wrap.
+  if (PATCHES.every(({ name }) => isMarkedPatched(patchedHolder[name]))) {
+    return "installed";
+  }
+
   const originals = PATCHES.map(({ name }) => {
-    const original = (prototype as unknown as Record<string, unknown>)[name];
+    const original = patchedHolder[name];
     if (typeof original !== "function") {
       throw new Error(`InteractiveMode.${name} missing`);
     }
     return original as AnyFunction;
   });
 
-  const patched = PATCHES.map(({ create }, index) => create(originals[index]));
-  PATCHES.forEach(({ name }, index) => {
-    (prototype as unknown as Record<string, unknown>)[name] = patched[index];
+  // Wrap sequentially; if any method is missing we bail out before touching the
+  // prototype (originals above already threw in that case).
+  PATCHES.forEach(({ name, create }, index) => {
+    patchedHolder[name] = markPatched(create(originals[index]));
   });
 
-  return () => {
-    PATCHES.forEach(({ name }, index) => {
-      const holder = prototype as unknown as Record<string, unknown>;
-      if (holder[name] === patched[index]) {
-        holder[name] = originals[index];
-      }
-    });
-  };
+  return "installed";
 }
 
-export async function retainPatch(): Promise<() => Promise<void>> {
+/**
+ * Install the patch once per process. Safe to call from anywhere, at any time,
+ * any number of times: concurrent calls share one in-flight promise.
+ */
+export function ensurePatchInstalled(): Promise<PatchStatus> {
   const state = getState();
-  state.refCount++;
+  if (state.status === "installed") return Promise.resolve("installed");
 
-  let cleanup = state.cleanup;
-  if (!cleanup) {
-    const pending = state.installPromise ?? installPatch();
-    state.installPromise = pending;
-    try {
-      cleanup = await pending;
-      state.cleanup ??= cleanup;
-    } catch (error) {
-      state.refCount--;
-      throw error;
-    } finally {
+  const pending = state.installPromise ?? installPatch();
+  state.installPromise = pending;
+  return pending.then(
+    (status) => {
+      state.status = status;
       if (state.installPromise === pending) state.installPromise = undefined;
-    }
-  }
-
-  let released = false;
-  return async () => {
-    if (released) return;
-    state.refCount = Math.max(0, state.refCount - 1);
-    released = true;
-    if (state.refCount > 0) return;
-
-    const currentCleanup = state.cleanup;
-    state.cleanup = undefined;
-    state.release = undefined;
-    currentCleanup?.();
-  };
+      return status;
+    },
+    (error) => {
+      state.status = "failed";
+      state.error = error instanceof Error ? error.message : String(error);
+      if (state.installPromise === pending) state.installPromise = undefined;
+      throw error;
+    },
+  );
 }
 
 function isStaleCtxError(error: unknown): boolean {
@@ -306,19 +339,71 @@ function isStaleCtxError(error: unknown): boolean {
   );
 }
 
+async function reportFailureOnce(ctx: {
+  hasUI?: boolean;
+  ui?: { notify(message: string, level?: "info" | "warning" | "error"): void };
+}): Promise<void> {
+  const state = getState();
+  if (state.status !== "failed" || !state.error) return;
+  try {
+    ctx.ui?.notify?.(`quiet-diagnostics inactive: ${state.error}`, "warning");
+  } catch {
+    /* ignore notify failures (including stale ctx) */
+  }
+}
+
 export default function (pi: ExtensionAPI) {
-  pi.on("session_start", async (_event, ctx) => {
+  // Install immediately at module load — before any session, any mode, any
+  // TUI. This is the whole point of v0.3.0: no window in which a session switch
+  // could render a warning through an unpatched prototype.
+  void ensurePatchInstalled().catch(() => {
+    /* retried on session_start; reported there once */
+  });
+
+  pi.registerCommand("quiet-diagnostics", {
+    description: "Show whether the startup-diagnostics patch is active",
+    handler: async (_args, ctx) => {
+      await ensurePatchInstalled().catch(() => {
+        /* status + error already recorded */
+      });
+      const state = getState();
+      const lines = [
+        `quiet-diagnostics ${state.status === "installed" ? "active" : state.status}`,
+        state.status === "installed"
+          ? "Hides advisory startup warnings (skill collisions, extension package/command warnings). Errors stay visible."
+          : `inactive (${state.error ?? "unknown error"})`,
+        `mode: ${ctx.mode}${ctx.isProjectTrusted?.() === false ? " (project untrusted)" : ""}`,
+        `cwd: ${ctx.cwd}`,
+        `session starts seen: ${state.sessionStarts.length > 0 ? state.sessionStarts.join(", ") : "none yet"}`,
+      ];
+      try {
+        ctx.ui.notify(lines.join("\n"), state.status === "installed" ? "info" : "warning");
+      } catch {
+        /* ignore notify failures */
+      }
+    },
+  });
+
+  pi.on("session_start", async (event, ctx) => {
     // Never throw from session_start — pi paints a red stack into the chat
     // for every failed extension handler, including "ctx is stale after
     // session replacement" races during rebind/init.
     try {
-      if (ctx.mode !== "tui") return;
-
       const state = getState();
-      // Patches are process-global. Keep across resume; only reinstall when missing.
-      if (state.cleanup && state.release) return;
+      state.sessionStarts.push(String(event.reason ?? "unknown"));
+      if (state.sessionStarts.length > 8) state.sessionStarts.shift();
 
-      state.release = await retainPatch();
+      // Module-load install normally already won the race; this is a cheap
+      // retry for the case where the initial import was still in flight or
+      // failed, plus a one-time report if it still can't install.
+      const status = await ensurePatchInstalled().catch((error) => {
+        if (isStaleCtxError(error)) return "failed" as const;
+        throw error;
+      });
+
+      if (status === "failed") {
+        await reportFailureOnce(ctx);
+      }
     } catch (error) {
       if (isStaleCtxError(error)) return;
       try {
@@ -332,19 +417,6 @@ export default function (pi: ExtensionAPI) {
         }
       } catch {
         /* ignore notify failures (including stale ctx) */
-      }
-    }
-  });
-
-  pi.on("session_shutdown", async (event) => {
-    if (
-      (event.reason === "reload" || event.reason === "quit") &&
-      getState().release
-    ) {
-      try {
-        await getState().release?.();
-      } catch {
-        /* ignore */
       }
     }
   });

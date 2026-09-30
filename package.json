@@ -1,6 +1,6 @@
 {
   "name": "pi-quiet-diagnostics",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A pi extension that silences advisory startup diagnostics (skill collisions, extension package/command warnings) while keeping real errors visible.",
   "type": "module",
   "license": "MIT",
@@ -24,6 +24,7 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "files": [
+    "CHANGELOG.md",
     "extensions/",
     "README.md",
     "LICENSE"

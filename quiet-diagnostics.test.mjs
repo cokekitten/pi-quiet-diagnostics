@@ -100,8 +100,24 @@ describe("isSilencedStartupWarning", () => {
       ),
       true,
     );
-    assert.equal(isSilencedStartupWarning('Failed to load extension "ext"'), false);
+    assert.equal(
+      isSilencedStartupWarning('Extension package "/pkg/package.json": something else advisory'),
+      true,
+    );
+    assert.equal(
+      isSilencedStartupWarning('Failed to load extension "ext"'),
+      false,
+    );
     assert.equal(isSilencedStartupWarning("tmux keyboard setup may be slow"), false);
+  });
+
+  it("tolerates a leading Warning: prefix and non-string input", () => {
+    assert.equal(
+      isSilencedStartupWarning('Warning: Extension package "/pkg/package.json": noisy'),
+      true,
+    );
+    assert.equal(isSilencedStartupWarning("Model fallback in use"), false);
+    assert.equal(isSilencedStartupWarning(undefined), false);
   });
 
   it("swallows silenced warnings and forwards everything else", () => {
@@ -255,82 +271,102 @@ async function loadPiInternals() {
   return { codingAgent, InteractiveMode: interactive.InteractiveMode };
 }
 
+// Load pi's internals once for the whole file. The patch is process-global and
+// never released, so the lifecycle tests share the installed state.
+const { codingAgent, InteractiveMode } = await loadPiInternals();
+
 describe("extension lifecycle", () => {
-  it("patches once on TUI session start and restores on reload", async () => {
-    const { codingAgent, InteractiveMode } = await loadPiInternals();
-    const extensionPath = join(process.cwd(), "extensions", "quiet-diagnostics.ts");
-    const originals = {
-      showLoadedResources: InteractiveMode.prototype.showLoadedResources,
-      showWarning: InteractiveMode.prototype.showWarning,
-    };
+  const extensionPath = join(process.cwd(), "extensions", "quiet-diagnostics.ts");
+
+  async function loadExtension() {
     const loaded = await codingAgent.discoverAndLoadExtensions(
       [extensionPath],
       process.cwd(),
     );
-
     assert.deepEqual(loaded.errors, []);
     const extension = loaded.extensions.find(
       (item) => item.resolvedPath === extensionPath,
     );
-    assert.ok(extension);
+    assert.ok(extension, "extension should load");
+    return extension;
+  }
 
-    const starts = extension.handlers.get("session_start") ?? [];
-    const shutdowns = extension.handlers.get("session_shutdown") ?? [];
-    assert.equal(starts.length, 1);
-    assert.equal(shutdowns.length, 1);
-
-    const notifications = [];
-    const ctx = {
-      mode: "tui",
-      hasUI: true,
-      ui: {
-        notify(message, level) {
-          notifications.push({ message, level });
+  function notifications() {
+    const collected = [];
+    return {
+      collected,
+      ctx: {
+        mode: "tui",
+        hasUI: true,
+        cwd: "/tmp",
+        isProjectTrusted: () => true,
+        ui: {
+          notify(message, level) {
+            collected.push({ message, level });
+          },
         },
       },
     };
+  }
 
-    await starts[0]({ type: "session_start", reason: "startup" }, ctx);
-    const patched = {
+  it("installs the patch at module load, before any session start", async () => {
+    const original = {
       showLoadedResources: InteractiveMode.prototype.showLoadedResources,
       showWarning: InteractiveMode.prototype.showWarning,
     };
-    assert.notStrictEqual(patched.showLoadedResources, originals.showLoadedResources);
-    assert.notStrictEqual(patched.showWarning, originals.showWarning);
+    // Loading the module runs the default export, which installs synchronously
+    // (kicks off an in-flight import resolved against pi's already-loaded
+    // module) — the very next session_start must find it installed.
+    const extension = await loadExtension();
+    const starts = extension.handlers.get("session_start") ?? [];
+    assert.equal(starts.length, 1);
 
-    await starts[0]({ type: "session_start", reason: "new" }, ctx);
-    assert.strictEqual(InteractiveMode.prototype.showLoadedResources, patched.showLoadedResources);
-    assert.strictEqual(InteractiveMode.prototype.showWarning, patched.showWarning);
-    assert.deepEqual(notifications, []);
+    const { collected, ctx } = notifications();
+    await starts[0]({ type: "session_start", reason: "startup" }, ctx);
 
-    await shutdowns[0]({ type: "session_shutdown", reason: "reload" }, ctx);
-    assert.strictEqual(
-      InteractiveMode.prototype.showLoadedResources,
-      originals.showLoadedResources,
-    );
-    assert.strictEqual(InteractiveMode.prototype.showWarning, originals.showWarning);
+    assert.notStrictEqual(InteractiveMode.prototype.showWarning, original);
+    assert.notStrictEqual(InteractiveMode.prototype.showLoadedResources, original.showLoadedResources);
+    // No error notifications for a healthy install.
+    assert.deepEqual(collected.filter((n) => n.level === "warning"), []);
   });
 
-  it("stays off the TUI patches outside interactive mode", async () => {
-    const { codingAgent, InteractiveMode } = await loadPiInternals();
-    const extensionPath = join(process.cwd(), "extensions", "quiet-diagnostics.ts");
-    const originals = {
-      showLoadedResources: InteractiveMode.prototype.showLoadedResources,
-      showWarning: InteractiveMode.prototype.showWarning,
-    };
-    const loaded = await codingAgent.discoverAndLoadExtensions(
-      [extensionPath],
-      process.cwd(),
-    );
-    const extension = loaded.extensions.find((item) => item.resolvedPath === extensionPath);
-    const start = (extension.handlers.get("session_start") ?? [])[0];
+  it("keeps the patch installed across session switches and reloads", async () => {
+    const extension = await loadExtension();
+    const starts = extension.handlers.get("session_start") ?? [];
+    // No shutdown handler anymore: the patch is intentionally never released.
+    assert.equal((extension.handlers.get("session_shutdown") ?? []).length, 0);
 
-    await start({ type: "session_start", reason: "startup" }, { mode: "rpc", hasUI: false });
+    const before = InteractiveMode.prototype.showWarning;
+    const { collected, ctx } = notifications();
+    for (const reason of ["startup", "resume", "new", "fork", "reload"]) {
+      await starts[0]({ type: "session_start", reason }, ctx);
+    }
+    // Same function object across every switch — never re-wrapped, never removed.
+    assert.strictEqual(InteractiveMode.prototype.showWarning, before);
+    assert.deepEqual(collected.filter((n) => n.level === "warning"), []);
+  });
 
+  it("does not double-wrap when the module is evaluated again (reload)", async () => {
+    const before = InteractiveMode.prototype.showWarning;
+    const extension = await loadExtension(); // second discoverAndLoadExtensions
+    const starts = extension.handlers.get("session_start") ?? [];
+    const { ctx } = notifications();
+    await starts[0]({ type: "session_start", reason: "reload" }, ctx);
     assert.strictEqual(
-      InteractiveMode.prototype.showLoadedResources,
-      originals.showLoadedResources,
+      InteractiveMode.prototype.showWarning,
+      before,
+      "reload must not stack a second wrapper",
     );
-    assert.strictEqual(InteractiveMode.prototype.showWarning, originals.showWarning);
+  });
+
+  it("exposes a /quiet-diagnostics self-check command", async () => {
+    const extension = await loadExtension();
+    const command = extension.commands.get("quiet-diagnostics");
+    assert.ok(command, "command should be registered");
+    const { collected, ctx } = notifications();
+    await command.handler("", ctx);
+    const info = collected.find((n) => n.message.includes("quiet-diagnostics"));
+    assert.ok(info, "command should report state");
+    assert.match(info.message, /active/i);
   });
 });

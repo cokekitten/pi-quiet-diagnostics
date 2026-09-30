@@ -30,7 +30,9 @@ Hidden:
   conflicts.
 - Replayed startup warnings of the form `Extension package "<path>": ...`
   (Pi renders each extension warning as one chat line before the TUI can filter
-  it at the source).
+  it at the source). Matching anchors: the `Extension package` prefix and Pi's
+  own `Host-provided extension packages must be declared in peerDependencies`
+  text, so a wording tweak upstream does not let the noise back in.
 
 Kept visible:
 
@@ -44,6 +46,40 @@ Changes display only. Skill discovery, precedence, loaded content, registered
 commands and shortcuts, sessions, and model context are untouched — the
 accessors are wrapped only while the startup block is rendered and restored
 afterwards, so autocomplete and tool registration always see the real data.
+
+## Lifecycle
+
+The patch is installed **once, at module load**, and stays installed for the
+life of the process. It is never released.
+
+0.2.x installed from the `session_start` handler and restored on
+`session_shutdown`. A session switch (`pi -c`, `pi -r`, `/resume`, fork) tears
+the old session down and builds a new one, which opened a window where a
+warning could reach the chat through a briefly unpatched prototype. A
+display-only filter has no reason to be transient, so 0.3.0 installs it as early
+as possible and leaves it alone. `/reload` re-evaluates the module, but the
+patched functions carry a marker so nothing is ever double-wrapped.
+
+## Self check
+
+```
+/quiet-diagnostics
+```
+
+Reports whether the patch is active, the run mode, the cwd, and the
+`session_start` reasons seen so far. Use it when warnings appear in one
+session but not another — it answers "is this extension even loaded here?"
+(usually: an old copy of this package, an install that is not user-scoped, or
+the project being untrusted) in one keypress.
+
+## Root cause of the `typebox` warnings
+
+The most common warnings come from third-party packages that ship a
+host-provided dependency (`typebox`) in `dependencies` instead of
+`peerDependencies` with a `"*"` range — Pi warns once per package, on every
+start. Pi provides `typebox` itself, so moving that one entry to
+`peerDependencies` in the offending `package.json` removes the warning at the
+source (this survives any pi upgrade and any resume path).
 
 ## Install
 
@@ -77,8 +113,9 @@ Run `pi --verbose` (or unset `quietStartup`) to see everything Pi reports.
 
 This extension monkey-patches Pi's private `InteractiveMode.prototype` methods
 `showLoadedResources` (resource blocks) and `showWarning` (replayed startup
-warnings). It fails open and shows a warning if Pi changes the internal module
-path or either method, but a Pi upgrade may still require an extension update.
+warnings). It fails open and reports through `/quiet-diagnostics` if Pi changes
+the internal module path or either method, but a Pi upgrade may still require
+an extension update. Verified against pi 0.99.1.
 
 ## Development
 
